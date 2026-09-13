@@ -876,7 +876,7 @@ void show_tile_context_menu(GtkWidget*, GdkEventButton* event,
         gtk_widget_get_style_context(menu), "lattice-context-menu");
 
     // --- Edit Launcher ---
-    GtkWidget* edit_item = gtk_menu_item_new_with_label("    Edit Launcher");
+    GtkWidget* edit_item = gtk_menu_item_new_with_label("    Edit Launcher");
     auto* edit_path = new std::string(desktop_path);
 
     g_signal_connect_data(
@@ -892,7 +892,7 @@ void show_tile_context_menu(GtkWidget*, GdkEventButton* event,
 
     // --- Show .desktop File ---
     GtkWidget* show_item =
-        gtk_menu_item_new_with_label("      Show File");
+        gtk_menu_item_new_with_label("      Show File");
     auto* show_path = new std::string(desktop_path);
 
     g_signal_connect_data(

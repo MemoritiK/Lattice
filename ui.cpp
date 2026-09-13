@@ -438,7 +438,6 @@ constexpr const char* LATTICE_CSS = R"CSS(
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.10);
     color: #f0f0f0;
-    transition: background 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
 }
 
 .lattice-search:focus,
@@ -465,9 +464,6 @@ constexpr const char* LATTICE_CSS = R"CSS(
     min-width: 0;
     min-height: 0;
     outline: none;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
-    transition: background 120ms ease, border-color 120ms ease,
-                box-shadow 120ms ease;
 }
 
 .lattice-tile:hover {
@@ -501,7 +497,6 @@ constexpr const char* LATTICE_CSS = R"CSS(
     min-width: 0;
     min-height: 0;
     outline: none;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
 }
 )CSS";
 
@@ -756,6 +751,25 @@ void launch_app(std::size_t app_index)
     }
 }
 
+static GtkWidget* create_menu_item(const char* text, const char* icon_name)
+{
+    GtkWidget* item = gtk_menu_item_new();
+    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+    GtkWidget* image =
+        gtk_image_new_from_icon_name(icon_name, GTK_ICON_SIZE_MENU);
+
+    GtkWidget* label = gtk_label_new(text);
+
+    gtk_box_pack_start(GTK_BOX(box), image, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+
+    gtk_container_add(GTK_CONTAINER(item), box);
+    gtk_widget_show_all(item);
+
+    return item;
+}
+
 void on_show_desktop_file_activate(GtkMenuItem*, gpointer user_data)
 {
     auto* path = static_cast<std::string*>(user_data);
@@ -873,43 +887,54 @@ void show_tile_context_menu(GtkWidget*, GdkEventButton* event,
 
     GtkWidget* menu = gtk_menu_new();
     gtk_style_context_add_class(
-        gtk_widget_get_style_context(menu), "lattice-context-menu");
+        gtk_widget_get_style_context(menu),
+        "lattice-context-menu"
+    );
 
     // --- Edit Launcher ---
-    GtkWidget* edit_item = gtk_menu_item_new_with_label("    Edit Launcher");
+    GtkWidget* edit_item =
+        create_menu_item(" Edit Launcher", "settings-symbolic");
+
     auto* edit_path = new std::string(desktop_path);
 
     g_signal_connect_data(
-        edit_item, "activate",
+        edit_item,
+        "activate",
         G_CALLBACK(on_edit_launcher_activate),
         edit_path,
         [](gpointer data, GClosure*) {
             delete static_cast<std::string*>(data);
         },
-        static_cast<GConnectFlags>(0));
+        static_cast<GConnectFlags>(0)
+    );
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), edit_item);
 
     // --- Show .desktop File ---
     GtkWidget* show_item =
-        gtk_menu_item_new_with_label("      Show File");
+        create_menu_item(" Show File", "document-export-symbolic");
+
     auto* show_path = new std::string(desktop_path);
 
     g_signal_connect_data(
-        show_item, "activate",
+        show_item,
+        "activate",
         G_CALLBACK(on_show_desktop_file_activate),
         show_path,
         [](gpointer data, GClosure*) {
             delete static_cast<std::string*>(data);
         },
-        static_cast<GConnectFlags>(0));
+        static_cast<GConnectFlags>(0)
+    );
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), show_item);
 
     gtk_widget_show_all(menu);
 
-    gtk_menu_popup_at_pointer(GTK_MENU(menu),
-                              reinterpret_cast<GdkEvent*>(event));
+    gtk_menu_popup_at_pointer(
+        GTK_MENU(menu),
+        reinterpret_cast<GdkEvent*>(event)
+    );
 }
 
 void on_back_menu_activate(GtkMenuItem*, gpointer)

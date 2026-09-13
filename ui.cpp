@@ -498,6 +498,13 @@ constexpr const char* LATTICE_CSS = R"CSS(
     min-height: 0;
     outline: none;
 }
+
+.lattice-tile:focus {
+    background: rgba(255, 255, 255, 0.045); /* same as resting */
+    border-color: rgba(255, 255, 255, 0.07);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+    transition: none;
+}
 )CSS";
 
 void install_css()
@@ -1477,15 +1484,14 @@ GtkWidget* current_visible_child()
 // both the flowbox's internal state and the widget-focus chain agree.
 void select_and_focus_child(GtkWidget* child)
 {
-    if (child == nullptr || g_ui.flow == nullptr || !GTK_IS_FLOW_BOX_CHILD(child))
+    if (child == nullptr ||
+        g_ui.flow == nullptr ||
+        !GTK_IS_FLOW_BOX_CHILD(child))
         return;
 
-    gtk_flow_box_select_child(GTK_FLOW_BOX(g_ui.flow),
-                              GTK_FLOW_BOX_CHILD(child));
-
-    GtkWidget* tile = gtk_bin_get_child(GTK_BIN(child));
-    if (tile != nullptr)
-        gtk_widget_grab_focus(tile);
+    gtk_flow_box_select_child(
+        GTK_FLOW_BOX(g_ui.flow),
+        GTK_FLOW_BOX_CHILD(child));
 }
 
 // Manual replacement for GtkFlowBox's built-in arrow-key navigation.

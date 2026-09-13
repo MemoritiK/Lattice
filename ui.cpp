@@ -4,6 +4,7 @@
 #include <gtk-layer-shell/gtk-layer-shell.h>
 #include <glib-unix.h>
 #include <glib.h>
+#include <pango/pangocairo.h>
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -40,9 +42,15 @@ constexpr const char* UI_LOCK_FILE     = "/tmp/lattice/ui.lock";
 constexpr const char* DAEMON_PID_FILE  = "/tmp/lattice/daemon.pid";
 constexpr const char* DEFAULT_TERMINAL = "foot";
 
-constexpr int ICON_SIZE   = 86;
-constexpr int TILE_HEIGHT = 150;
-constexpr int MINI        = 36;
+constexpr int ICON_SIZE    = 86;
+constexpr int TILE_HEIGHT  = 150;
+constexpr int MINI         = 36;
+
+// Approximates the padding the old ".lattice-tile > box" CSS rule gave
+// the (now-removed) inner GtkBox. Tiles are drawn by hand now (see
+// Section 11), so this is baked directly into the draw code instead
+// of coming from CSS.
+constexpr int TILE_PADDING = 6;
 
 // Number of tiles per row in the flow grid. Kept as a single named
 // constant because the manual keyboard-navigation logic (see
@@ -290,7 +298,10 @@ struct Ui
     // Cached DB so drill-down doesn't re-read the file every click.
     // Dropped back to a fresh, empty Database whenever the window is
     // hidden -- see hide_ui() -- so an idle lattice-ui holds no app
-    // metadata, icon pixbufs, or tile widgets in memory.
+    // metadata or tile widgets in memory. (Decoded icon pixbufs are
+    // NOT dropped here -- they live in the process-lifetime icon
+    // cache in Section 8, so re-showing the launcher doesn't mean
+    // re-decoding every icon from disk.)
     Database db;
     bool     db_loaded = false;
 
@@ -313,7 +324,8 @@ Ui g_ui;
 // Section 5: Forward declarations
 // ===========================================================================
 
-// --- Tile construction ---
+// --- Tile data / drawing ---
+struct TileData;
 GtkWidget* make_tile(const std::string& label,
                      const std::string& icon_name,
                      GCallback          on_click,
@@ -324,10 +336,12 @@ GtkWidget* make_group_tile(const std::string& label,
                            GCallback on_click,
                            gpointer  user_data);
 GtkWidget* make_back_tile();
+gboolean   on_tile_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data);
 
 // --- Icon helpers ---
 GdkPixbuf* load_icon_pixbuf(const std::string& name, int size);
-GtkWidget* make_icon(const std::string& icon_name);
+GdkPixbuf* load_icon_pixbuf_cached(const std::string& name, int size);
+GdkPixbuf* load_icon_pixbuf_with_fallback(const std::string& name, int size);
 
 // --- Population ---
 void populate_top_level();
@@ -353,6 +367,10 @@ GtkWidget*  current_visible_child();
 void        select_and_focus_child(GtkWidget* child);
 gboolean    move_selection(int delta_row, int delta_col);
 
+// --- Focus-follows-scroll (single window-level handler; see Section 13) ---
+void scroll_widget_into_view(GtkWidget* widget);
+void on_window_set_focus(GtkWindow*, GtkWidget* widget, gpointer);
+
 // --- Callbacks ---
 gboolean on_search_changed(GtkSearchEntry* entry, gpointer);
 void     on_search_activate(GtkSearchEntry*, gpointer);
@@ -362,7 +380,6 @@ void     on_launch_clicked(GtkButton*, gpointer);
 void     on_group_clicked(GtkButton*, gpointer);
 void     on_back_clicked(GtkButton*, gpointer);
 gboolean on_tile_button_press(GtkWidget*, GdkEventButton*, gpointer);
-gboolean on_tile_focus_in(GtkWidget*, GdkEventFocus*, gpointer);
 gboolean on_scroll_event(GtkWidget*, GdkEventScroll*, gpointer);
 gboolean on_flow_key_press(GtkWidget*, GdkEventKey*, gpointer);
 gboolean on_search_key_press(GtkWidget*, GdkEventKey*, gpointer);
@@ -453,11 +470,6 @@ constexpr const char* LATTICE_CSS = R"CSS(
                 box-shadow 120ms ease;
 }
 
-.lattice-tile > box {
-    padding: 6px;
-    margin: 0;
-}
-
 .lattice-tile:hover {
     background: rgba(255, 255, 255, 0.10);
     border-color: rgba(244, 67, 54, 0.45);
@@ -466,12 +478,6 @@ constexpr const char* LATTICE_CSS = R"CSS(
 .lattice-tile:active {
     background: rgba(244, 67, 54, 0.22);
     border-color: rgba(244, 67, 54, 0.85);
-}
-
-.lattice-tile-label {
-    color: #eaeaea;
-    font-size: 12px;
-    font-weight: 500;
 }
 
 .lattice-flow {
@@ -515,6 +521,23 @@ void install_css()
 
 // ===========================================================================
 // Section 8: Icon helpers
+//
+// load_icon_pixbuf() is the raw, uncached decode -- exactly as before.
+// Everything else in the launcher should go through
+// load_icon_pixbuf_cached() (or load_icon_pixbuf_with_fallback() for
+// spots that want a generic icon when lookup fails) so that repeated
+// tile rebuilds -- which happen on every populate_top_level()/
+// populate_group() call, i.e. every time the window is shown -- don't
+// re-decode the same icon files or re-walk the icon theme over and
+// over. The cache is keyed by "name@size" and lives for the process
+// lifetime; entries (including failed lookups, cached as nullptr) are
+// never evicted, so a pathological number of *distinct* icon
+// name/size pairs could grow this cache unboundedly, but for a
+// launcher's icon set that's a non-issue in practice.
+//
+// IMPORTANT: pixbufs returned by the cached helpers below are
+// borrowed references owned by the cache. Callers must NOT
+// g_object_unref() them.
 // ===========================================================================
 
 GdkPixbuf* load_icon_pixbuf(const std::string& name, int size)
@@ -551,16 +574,76 @@ GdkPixbuf* load_icon_pixbuf(const std::string& name, int size)
         nullptr);
 }
 
-GtkWidget* make_icon(const std::string& icon_name)
+GdkPixbuf* load_icon_pixbuf_cached(const std::string& name, int size)
 {
-    if (GdkPixbuf* pix = load_icon_pixbuf(icon_name, ICON_SIZE)) {
-        GtkWidget* image = gtk_image_new_from_pixbuf(pix);
-        g_object_unref(pix);
-        return image;
-    }
+    static std::unordered_map<std::string, GdkPixbuf*> cache;
 
-    return gtk_image_new_from_icon_name(
-        "application-x-executable", GTK_ICON_SIZE_DIALOG);
+    const std::string key = name + "@" + std::to_string(size);
+
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;   // may be nullptr; that's cached too
+
+    GdkPixbuf* pix = load_icon_pixbuf(name, size);
+    cache.emplace(key, pix);
+    return pix;
+}
+
+// Same as load_icon_pixbuf_cached(), but falls back to a generic
+// "application-x-executable" icon (also cached, per size) instead of
+// returning nullptr. Matches the old make_icon() behaviour for
+// single-icon tiles. NOT used for group-tile mini icons, where a
+// missing member icon should render as blank space, not a generic
+// icon cluttering the 2x2 grid.
+GdkPixbuf* load_icon_pixbuf_with_fallback(const std::string& name, int size)
+{
+    if (GdkPixbuf* pix = load_icon_pixbuf_cached(name, size))
+        return pix;
+
+    static std::unordered_map<int, GdkPixbuf*> fallback_cache;
+
+    auto it = fallback_cache.find(size);
+    if (it != fallback_cache.end()) return it->second;
+
+    GdkPixbuf* fallback = gtk_icon_theme_load_icon(
+        gtk_icon_theme_get_default(),
+        "application-x-executable",
+        size,
+        GTK_ICON_LOOKUP_FORCE_SIZE,
+        nullptr);
+
+    fallback_cache.emplace(size, fallback);
+    return fallback;
+}
+
+// Fixed look for hand-drawn tile labels (see Section 11). Tiles used
+// to get this from the ".lattice-tile-label" CSS class on a GtkLabel;
+// now that labels are painted directly with cairo/pango there's no
+// GtkLabel for that CSS rule to match, so the same visual values are
+// baked in here once instead.
+const GdkRGBA& tile_label_color()
+{
+    static GdkRGBA color;
+    static bool    parsed = false;
+
+    if (!parsed) {
+        if (!gdk_rgba_parse(&color, "#eaeaea"))
+            color = GdkRGBA{ 0.92, 0.92, 0.92, 1.0 };
+        parsed = true;
+    }
+    return color;
+}
+
+PangoFontDescription* tile_label_font()
+{
+    static PangoFontDescription* desc = nullptr;
+
+    if (desc == nullptr) {
+        desc = pango_font_description_new();
+        pango_font_description_set_family(desc, "sans");
+        pango_font_description_set_size(desc, 9 * PANGO_SCALE);   // ~12px
+        pango_font_description_set_weight(desc, PANGO_WEIGHT_MEDIUM);
+    }
+    return desc;
 }
 
 
@@ -793,7 +876,7 @@ void show_tile_context_menu(GtkWidget*, GdkEventButton* event,
         gtk_widget_get_style_context(menu), "lattice-context-menu");
 
     // --- Edit Launcher ---
-    GtkWidget* edit_item = gtk_menu_item_new_with_label("    Edit Launcher");
+    GtkWidget* edit_item = gtk_menu_item_new_with_label("    Edit Launcher");
     auto* edit_path = new std::string(desktop_path);
 
     g_signal_connect_data(
@@ -809,7 +892,7 @@ void show_tile_context_menu(GtkWidget*, GdkEventButton* event,
 
     // --- Show .desktop File ---
     GtkWidget* show_item =
-        gtk_menu_item_new_with_label("      Show File");
+        gtk_menu_item_new_with_label("      Show File");
     auto* show_path = new std::string(desktop_path);
 
     g_signal_connect_data(
@@ -894,44 +977,15 @@ gboolean on_tile_button_press(GtkWidget*, GdkEventButton* event, gpointer data)
     return FALSE;
 }
 
-// Keeps the keyboard-focused tile scrolled into view -- needed now
-// that arrow keys move real widget focus instead of just scrolling.
-gboolean on_tile_focus_in(GtkWidget* tile, GdkEventFocus*, gpointer)
-{
-    if (g_ui.scroll == nullptr || g_ui.flow == nullptr) return FALSE;
-
-    GtkAllocation alloc;
-    gtk_widget_get_allocation(tile, &alloc);
-
-    gint tile_y = 0;
-    gtk_widget_translate_coordinates(
-        tile, g_ui.flow, 0, 0, nullptr, &tile_y);
-
-    GtkAdjustment* adj =
-        gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(g_ui.scroll));
-    if (adj == nullptr) return FALSE;
-
-    double top        = tile_y;
-    double bottom     = tile_y + alloc.height;
-    double view_top   = gtk_adjustment_get_value(adj);
-    double view_bottom = view_top + gtk_adjustment_get_page_size(adj);
-
-    if (top < view_top)
-        gtk_adjustment_set_value(adj, top);
-    else if (bottom > view_bottom)
-        gtk_adjustment_set_value(
-            adj, bottom - gtk_adjustment_get_page_size(adj));
-
-    return FALSE;
-}
-
-// Wires the behaviour every tile shares: right-click menu 
+// Wires the behaviour every *app* tile needs on top of the shared
+// click handler: a right-click context menu for editing/showing its
+// .desktop file. Non-app tiles (groups, back) pass app_index < 0 and
+// get no extra wiring -- keyboard-focus scrolling used to be wired
+// per-tile here too, but that's now handled by a single window-level
+// "set-focus" handler (see Section 13 / on_window_set_focus), so
+// there is nothing to connect for them at all.
 void wire_common_tile_behavior(GtkWidget* tile, long app_index)
 {
-    gtk_widget_add_events(tile, GDK_FOCUS_CHANGE_MASK);
-    g_signal_connect(tile, "focus-in-event",
-                     G_CALLBACK(on_tile_focus_in), nullptr);
-
     if (app_index >= 0) {
         gtk_widget_add_events(tile, GDK_BUTTON_PRESS_MASK);
         g_signal_connect(tile, "button-press-event",
@@ -943,17 +997,116 @@ void wire_common_tile_behavior(GtkWidget* tile, long app_index)
 
 // ===========================================================================
 // Section 11: Tile builders
+//
+// Tiles used to be a GtkButton -> GtkBox -> (GtkImage, GtkLabel) tree
+// (4 widgets each). With hundreds of apps that's a lot of widget
+// overhead for what's fundamentally "one icon + one line of text".
+// Tiles are now a GtkButton -> GtkDrawingArea (2 widgets), with the
+// icon(s) and label painted directly in a "draw" handler
+// (on_tile_draw) driven by a small TileData struct attached to the
+// button. This keeps every behavioural hook that depends on there
+// being exactly one child widget under the button (context menus,
+// search-matching, keynav) working unchanged -- they just read
+// TileData instead of walking GtkLabel/GtkBox children.
 // ===========================================================================
 
-// app_index: pass the real index into db.apps() for a launchable tile
-// (enables the right-click "Edit Launcher" menu); pass -1 for
-// non-app tiles (groups, back button).
-GtkWidget* make_tile(
-    const std::string& label,
-    const std::string& icon_name,
-    GCallback          on_click,
-    gpointer           user_data,
-    long               app_index)
+// Everything on_tile_draw() needs to paint a tile. `icons` holds one
+// borrowed (cache-owned, never unref'd here) pixbuf for a normal/back
+// tile, or up to four (with possible nullptr gaps) for a group tile's
+// 2x2 mini-grid.
+struct TileData
+{
+    std::string             label;
+    std::vector<GdkPixbuf*> icons;
+    bool                    is_group = false;
+    bool                    is_back  = false;
+};
+
+void tile_data_free(gpointer data)
+{
+    delete static_cast<TileData*>(data);
+}
+
+gboolean on_tile_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data)
+{
+    auto* td = static_cast<TileData*>(user_data);
+    if (td == nullptr) return FALSE;
+
+    GtkAllocation alloc;
+    gtk_widget_get_allocation(widget, &alloc);
+    const int width  = alloc.width;
+    const int height = alloc.height;
+
+    int icon_bottom = TILE_PADDING;
+
+    if (td->is_group) {
+        // 2x2 mini icon grid, centered horizontally.
+        constexpr int spacing = 3;
+        const int grid_w = MINI * 2 + spacing;
+        const int gx0    = (width - grid_w) / 2;
+        const int gy0    = TILE_PADDING + 8;
+
+        for (int i = 0; i < 4; ++i) {
+            const int col = i % 2;
+            const int row = i / 2;
+            const int x   = gx0 + col * (MINI + spacing);
+            const int y   = gy0 + row * (MINI + spacing);
+
+            if (i < static_cast<int>(td->icons.size()) && td->icons[i] != nullptr) {
+                gdk_cairo_set_source_pixbuf(cr, td->icons[i], x, y);
+                cairo_paint(cr);
+            }
+        }
+
+        icon_bottom = gy0 + MINI * 2 + spacing;
+    } else if (!td->icons.empty() && td->icons[0] != nullptr) {
+        GdkPixbuf* pix = td->icons[0];
+        const int  iw  = gdk_pixbuf_get_width(pix);
+        const int  ih  = gdk_pixbuf_get_height(pix);
+        const int  x   = (width - iw) / 2;
+        const int  y   = TILE_PADDING + 6;
+
+        gdk_cairo_set_source_pixbuf(cr, pix, x, y);
+        cairo_paint(cr);
+
+        icon_bottom = y + ih;
+    }
+
+    if (td->label.empty()) return FALSE;
+
+    PangoLayout* layout = gtk_widget_create_pango_layout(widget, td->label.c_str());
+    pango_layout_set_font_description(layout, tile_label_font());
+    pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+    pango_layout_set_width(layout, std::max(1, width - 2 * TILE_PADDING) * PANGO_SCALE);
+    pango_layout_set_height(layout, -2);   // clamp to at most 2 lines
+
+    int text_w = 0, text_h = 0;
+    pango_layout_get_pixel_size(layout, &text_w, &text_h);
+
+    double lx = TILE_PADDING;
+    double ly = height - text_h - TILE_PADDING;
+    if (ly < icon_bottom + 2) ly = icon_bottom + 2;
+
+    const GdkRGBA& color = tile_label_color();
+
+    cairo_save(cr);
+    gdk_cairo_set_source_rgba(cr, &color);
+    cairo_move_to(cr, lx, ly);
+    pango_cairo_show_layout(cr, layout);
+    cairo_restore(cr);
+
+    g_object_unref(layout);
+    return FALSE;
+}
+
+// Shared skeleton for all three tile kinds: a borderless GtkButton
+// containing one GtkDrawingArea, with TileData wired up for
+// on_tile_draw(). Returns the canvas so callers can finish wiring
+// their own "draw" data (each tile kind has different icon/label
+// content, filled in by the caller before this returns control).
+GtkWidget* make_tile_shell(GtkWidget** out_canvas)
 {
     GtkWidget* tile = gtk_button_new();
     gtk_button_set_relief(GTK_BUTTON(tile), GTK_RELIEF_NONE);
@@ -961,37 +1114,41 @@ GtkWidget* make_tile(
         gtk_widget_get_style_context(tile), "lattice-tile");
 
     gtk_widget_set_can_focus(tile, TRUE);
-
-    // Hard fixed size -- never grows or shrinks.
     gtk_widget_set_size_request(tile, -1, TILE_HEIGHT);
     gtk_widget_set_hexpand(tile, TRUE);
     gtk_widget_set_vexpand(tile, FALSE);
     gtk_widget_set_halign(tile, GTK_ALIGN_FILL);
     gtk_widget_set_valign(tile, GTK_ALIGN_START);
 
-    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_widget_set_valign(vbox, GTK_ALIGN_CENTER);
-    gtk_widget_set_halign(tile, GTK_ALIGN_FILL);
-    gtk_container_add(GTK_CONTAINER(tile), vbox);
+    GtkWidget* canvas = gtk_drawing_area_new();
+    gtk_widget_set_hexpand(canvas, TRUE);
+    gtk_widget_set_vexpand(canvas, TRUE);
+    gtk_container_add(GTK_CONTAINER(tile), canvas);
 
-    GtkWidget* icon = make_icon(icon_name);
-    gtk_widget_set_halign(icon, GTK_ALIGN_CENTER);
-    gtk_widget_set_valign(icon, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(vbox), icon, FALSE, FALSE, 0);
+    *out_canvas = canvas;
+    return tile;
+}
 
-    GtkWidget* name = gtk_label_new(label.c_str());
-    gtk_style_context_add_class(
-        gtk_widget_get_style_context(name), "lattice-tile-label");
-    gtk_label_set_xalign(GTK_LABEL(name), 0.5f);
-    gtk_label_set_justify(GTK_LABEL(name), GTK_JUSTIFY_CENTER);
-    gtk_label_set_width_chars(GTK_LABEL(name), -1);
-    gtk_label_set_max_width_chars(GTK_LABEL(name), 20);
-    gtk_label_set_lines(GTK_LABEL(name), 2);
-    gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_END);
-    gtk_label_set_line_wrap(GTK_LABEL(name), TRUE);
-    gtk_label_set_line_wrap_mode(GTK_LABEL(name), PANGO_WRAP_WORD_CHAR);
+// app_index: pass the real index into db.apps() for a launchable tile
+// (enables the right-click "Edit Launcher" menu); pass -1 for
+// non-app tiles (groups, back).
+GtkWidget* make_tile(
+    const std::string& label,
+    const std::string& icon_name,
+    GCallback          on_click,
+    gpointer           user_data,
+    long               app_index)
+{
+    GtkWidget* canvas = nullptr;
+    GtkWidget* tile   = make_tile_shell(&canvas);
 
-    gtk_box_pack_start(GTK_BOX(vbox), name, FALSE, FALSE, 0);
+    auto* td = new TileData();
+    td->label = label;
+    td->icons.push_back(load_icon_pixbuf_with_fallback(icon_name, ICON_SIZE));
+
+    g_object_set_data_full(G_OBJECT(tile), "lattice-tile-data",
+                           td, tile_data_free);
+    g_signal_connect(canvas, "draw", G_CALLBACK(on_tile_draw), td);
 
     if (on_click != nullptr)
         g_signal_connect(tile, "clicked", on_click, user_data);
@@ -1002,80 +1159,38 @@ GtkWidget* make_tile(
 }
 
 // A group tile: same fixed size, but a 2x2 mini-grid icon drawn
+// instead of a single big one.
 GtkWidget* make_group_tile(
     const std::string& label,
     const std::vector<std::string>& member_icons,
     GCallback on_click,
     gpointer  user_data)
 {
-    GtkWidget* tile = gtk_button_new();
-    gtk_button_set_relief(GTK_BUTTON(tile), GTK_RELIEF_NONE);
-    gtk_style_context_add_class(
-        gtk_widget_get_style_context(tile), "lattice-tile");
+    GtkWidget* canvas = nullptr;
+    GtkWidget* tile   = make_tile_shell(&canvas);
+
     gtk_style_context_add_class(
         gtk_widget_get_style_context(tile), "lattice-tile-group");
-
-    gtk_widget_set_can_focus(tile, TRUE);
-
-    gtk_widget_set_size_request(tile, -1, TILE_HEIGHT);
     gtk_widget_set_hexpand(tile, FALSE);
-    gtk_widget_set_vexpand(tile, FALSE);
-    gtk_widget_set_halign(tile, GTK_ALIGN_FILL);
-    gtk_widget_set_valign(tile, GTK_ALIGN_START);
 
-    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_widget_set_valign(vbox, GTK_ALIGN_CENTER);
-    gtk_widget_set_halign(vbox, GTK_ALIGN_CENTER);
-    gtk_container_add(GTK_CONTAINER(tile), vbox);
-
-    // 2x2 grid of mini icons.
-    GtkWidget* grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 3);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 3);
-    gtk_widget_set_halign(grid, GTK_ALIGN_CENTER);
-    gtk_widget_set_valign(grid, GTK_ALIGN_CENTER);
+    auto* td = new TileData();
+    td->label    = label;
+    td->is_group = true;
 
     const int count = static_cast<int>(member_icons.size());
-
     for (int i = 0; i < 4; ++i) {
-        if (i >= count || member_icons[i].empty()) {
-            GtkWidget* spacer = gtk_drawing_area_new();
-            gtk_widget_set_size_request(spacer, MINI, MINI);
-            gtk_grid_attach(GTK_GRID(grid), spacer, i % 2, i / 2, 1, 1);
-            continue;
-        }
-
-        // Theme-name OR file-path aware loader
-        GdkPixbuf* pix = load_icon_pixbuf(member_icons[i], MINI);
-
-        if (!pix) {
-            GtkWidget* spacer = gtk_drawing_area_new();
-            gtk_widget_set_size_request(spacer, MINI, MINI);
-            gtk_grid_attach(GTK_GRID(grid), spacer, i % 2, i / 2, 1, 1);
-            continue;
-        }
-
-        GtkWidget* mini = gtk_image_new_from_pixbuf(pix);
-        g_object_unref(pix);
-
-        gtk_widget_set_size_request(mini, MINI, MINI);
-        gtk_grid_attach(GTK_GRID(grid), mini, i % 2, i / 2, 1, 1);
+        if (i < count && !member_icons[i].empty())
+            // No fallback here on purpose: a missing member icon
+            // should render as blank space in the 2x2 grid, not a
+            // generic icon, matching the pre-refactor behaviour.
+            td->icons.push_back(load_icon_pixbuf_cached(member_icons[i], MINI));
+        else
+            td->icons.push_back(nullptr);
     }
 
-    gtk_box_pack_start(GTK_BOX(vbox), grid, FALSE, FALSE, 0);
-
-    GtkWidget* name = gtk_label_new(label.c_str());
-    gtk_style_context_add_class(
-        gtk_widget_get_style_context(name), "lattice-tile-label");
-    gtk_label_set_xalign(GTK_LABEL(name), 0.5f);
-    gtk_label_set_justify(GTK_LABEL(name), GTK_JUSTIFY_CENTER);
-    gtk_label_set_max_width_chars(GTK_LABEL(name), 20);
-    gtk_label_set_lines(GTK_LABEL(name), 2);
-    gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_END);
-    gtk_label_set_line_wrap(GTK_LABEL(name), TRUE);
-    gtk_label_set_line_wrap_mode(GTK_LABEL(name), PANGO_WRAP_WORD_CHAR);
-
-    gtk_box_pack_start(GTK_BOX(vbox), name, FALSE, FALSE, 0);
+    g_object_set_data_full(G_OBJECT(tile), "lattice-tile-data",
+                           td, tile_data_free);
+    g_signal_connect(canvas, "draw", G_CALLBACK(on_tile_draw), td);
 
     g_signal_connect(tile, "clicked", on_click, user_data);
 
@@ -1086,38 +1201,21 @@ GtkWidget* make_group_tile(
 
 GtkWidget* make_back_tile()
 {
-    GtkWidget* tile = gtk_button_new();
-    gtk_button_set_relief(GTK_BUTTON(tile), GTK_RELIEF_NONE);
-    gtk_style_context_add_class(
-        gtk_widget_get_style_context(tile), "lattice-tile");
+    GtkWidget* canvas = nullptr;
+    GtkWidget* tile   = make_tile_shell(&canvas);
+
     gtk_style_context_add_class(
         gtk_widget_get_style_context(tile), "lattice-tile-back");
-
-    gtk_widget_set_can_focus(tile, TRUE);
-
-    gtk_widget_set_size_request(tile, -1, TILE_HEIGHT);
     gtk_widget_set_hexpand(tile, FALSE);
-    gtk_widget_set_vexpand(tile, FALSE);
-    gtk_widget_set_halign(tile, GTK_ALIGN_FILL);
-    gtk_widget_set_valign(tile, GTK_ALIGN_START);
 
-    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_widget_set_valign(vbox, GTK_ALIGN_CENTER);
-    gtk_widget_set_halign(tile, GTK_ALIGN_FILL);
-    gtk_container_add(GTK_CONTAINER(tile), vbox);
+    auto* td = new TileData();
+    td->label   = "Back";
+    td->is_back = true;
+    td->icons.push_back(load_icon_pixbuf_with_fallback("go-previous", ICON_SIZE));
 
-    GtkWidget* icon = gtk_image_new_from_icon_name(
-        "go-previous", GTK_ICON_SIZE_DIALOG);
-    gtk_widget_set_halign(icon, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(vbox), icon, FALSE, FALSE, 0);
-
-    GtkWidget* name = gtk_label_new("Back");
-    gtk_style_context_add_class(
-        gtk_widget_get_style_context(name), "lattice-tile-label");
-    gtk_label_set_xalign(GTK_LABEL(name), 0.5f);
-    gtk_label_set_justify(GTK_LABEL(name), GTK_JUSTIFY_CENTER);
-
-    gtk_box_pack_start(GTK_BOX(vbox), name, FALSE, FALSE, 0);
+    g_object_set_data_full(G_OBJECT(tile), "lattice-tile-data",
+                           td, tile_data_free);
+    g_signal_connect(canvas, "draw", G_CALLBACK(on_tile_draw), td);
 
     g_signal_connect(tile, "clicked",
                      G_CALLBACK(on_back_clicked), nullptr);
@@ -1183,7 +1281,7 @@ void ensure_db_loaded()
 
 
 // ===========================================================================
-// Section 13: Scrolling & keyboard grid navigation
+// Section 13: Scrolling, keyboard grid navigation & focus-follows-scroll
 // ===========================================================================
 //
 // Arrow-key navigation used to be delegated entirely to GtkFlowBox's
@@ -1231,6 +1329,56 @@ gboolean on_scroll_event(GtkWidget*, GdkEventScroll* event, gpointer)
         case GDK_SCROLL_DOWN: scroll_by(g_ui.scroll,  step); return TRUE;
         default: return FALSE;
     }
+}
+
+// Scrolls `widget` into view within g_ui.scroll, if it's a descendant
+// of g_ui.flow. Used to keep the keyboard-focused tile visible --
+// previously wired as a "focus-in-event" handler on every single
+// tile; now called once from a single window-level "set-focus"
+// handler (on_window_set_focus, below), which fires for whatever
+// widget GTK just focused, tile or not. Non-tile targets (e.g. the
+// search entry) simply fail the "is this under g_ui.flow" walk and
+// return early.
+void scroll_widget_into_view(GtkWidget* widget)
+{
+    if (widget == nullptr || g_ui.scroll == nullptr || g_ui.flow == nullptr)
+        return;
+
+    // Walk up from the focused widget to find the direct flowbox
+    // child that contains it. If we hit the flowbox itself or run
+    // out of parents first, this focus event isn't about a tile.
+    GtkWidget* w = widget;
+    while (w != nullptr && w != g_ui.flow && gtk_widget_get_parent(w) != g_ui.flow)
+        w = gtk_widget_get_parent(w);
+
+    if (w == nullptr || w == g_ui.flow) return;
+
+    GtkAllocation alloc;
+    gtk_widget_get_allocation(widget, &alloc);
+
+    gint tile_y = 0;
+    gtk_widget_translate_coordinates(
+        widget, g_ui.flow, 0, 0, nullptr, &tile_y);
+
+    GtkAdjustment* adj =
+        gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(g_ui.scroll));
+    if (adj == nullptr) return;
+
+    double top         = tile_y;
+    double bottom      = tile_y + alloc.height;
+    double view_top    = gtk_adjustment_get_value(adj);
+    double view_bottom = view_top + gtk_adjustment_get_page_size(adj);
+
+    if (top < view_top)
+        gtk_adjustment_set_value(adj, top);
+    else if (bottom > view_bottom)
+        gtk_adjustment_set_value(
+            adj, bottom - gtk_adjustment_get_page_size(adj));
+}
+
+void on_window_set_focus(GtkWindow*, GtkWidget* widget, gpointer)
+{
+    scroll_widget_into_view(widget);
 }
 
 // Rebuilds the ordered list of visible flowbox children. Call this
@@ -1640,43 +1788,26 @@ gboolean on_search_changed(GtkSearchEntry* entry, gpointer)
             continue;
         }
 
-        // Back tile always visible.
-        GtkWidget* vbox = gtk_bin_get_child(GTK_BIN(tile));
-        bool match    = needle.empty();
-        bool is_back  = false;
+        // Tiles carry their own searchable label + back-ness via
+        // TileData now, rather than us walking down into GtkLabel
+        // children that no longer exist. The top-level "no database"
+        // placeholder is a bare GtkLabel with no TileData attached,
+        // so it falls through to "always visible", same as before.
+        auto* td = static_cast<TileData*>(
+            g_object_get_data(G_OBJECT(tile), "lattice-tile-data"));
 
-        if (vbox != nullptr) {
-            GList* parts =
-                gtk_container_get_children(GTK_CONTAINER(vbox));
+        bool match = needle.empty();
 
-            for (GList* p = parts; p; p = p->next) {
-                if (!GTK_IS_LABEL(p->data)) continue;
-
-                const gchar* label =
-                    gtk_label_get_text(GTK_LABEL(p->data));
-
-                if (label == nullptr) continue;
-
-                std::string hay(label);
-
-                if (hay == "Back") { is_back = true; break; }
-
-                if (!match) {
-                    std::transform(
-                        hay.begin(), hay.end(), hay.begin(),
-                        [](unsigned char c) {
-                            return std::tolower(c);
-                        });
-
-                    if (fuzzy_match(needle, hay))
-                        match = true;
-                }
-            }
-
-            g_list_free(parts);
+        if (td == nullptr) {
+            match = true;
+        } else if (td->is_back) {
+            match = true;
+        } else if (!match) {
+            std::string hay = td->label;
+            std::transform(hay.begin(), hay.end(), hay.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            match = fuzzy_match(needle, hay);
         }
-
-        if (is_back) match = true;
 
         gtk_widget_set_visible(wrapper, match);
     }
@@ -1724,28 +1855,13 @@ void on_search_activate(GtkSearchEntry*, gpointer)
         GtkWidget* tile = gtk_bin_get_child(GTK_BIN(wrapper));
         if (tile == nullptr) continue;
 
-        // Skip the Back tile -- it has no app to launch.
-        GtkWidget* vbox = gtk_bin_get_child(GTK_BIN(tile));
-        bool is_back = false;
+        auto* td = static_cast<TileData*>(
+            g_object_get_data(G_OBJECT(tile), "lattice-tile-data"));
 
-        if (vbox != nullptr) {
-            GList* parts =
-                gtk_container_get_children(GTK_CONTAINER(vbox));
-            for (GList* p = parts; p; p = p->next) {
-                if (!GTK_IS_LABEL(p->data)) continue;
-                const gchar* txt =
-                    gtk_label_get_text(GTK_LABEL(p->data));
-                if (txt && std::string(txt) == "Back") {
-                    is_back = true;
-                    break;
-                }
-            }
-            g_list_free(parts);
-        }
+        // Skip the Back tile -- it has no app to launch.
+        if (td != nullptr && td->is_back) continue;
 
         std::fprintf(stderr, "[lattice] activate fired\n");
-
-        if (is_back) continue;
 
         if (GTK_IS_BUTTON(tile)) {
             gtk_button_clicked(GTK_BUTTON(tile));
@@ -1935,6 +2051,14 @@ void build_skeleton()
                      G_CALLBACK(on_delete_event), nullptr);
     g_signal_connect(g_ui.window, "key-press-event",
                      G_CALLBACK(on_key_press), nullptr);
+
+    // Single window-level focus tracker: replaces the old per-tile
+    // "focus-in-event" handlers (one connection instead of one per
+    // tile) and keeps the focused tile scrolled into view no matter
+    // how focus got there (mouse click, Tab, or our own manual
+    // keynav in select_and_focus_child()).
+    g_signal_connect(g_ui.window, "set-focus",
+                     G_CALLBACK(on_window_set_focus), nullptr);
 
     g_ui.main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_style_context_add_class(

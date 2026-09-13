@@ -1404,10 +1404,7 @@ gboolean on_flow_key_press(GtkWidget*, GdkEventKey* event, gpointer)
                 hide_ui();
             return TRUE;
         }
-
         default: {
-            // Type-ahead: start typing anywhere in the grid and it's
-            // redirected into the search box, cursor at the end.
             if (g_ui.search == nullptr) return FALSE;
 
             gunichar ch = gdk_keyval_to_unicode(event->keyval);
@@ -1417,16 +1414,17 @@ gboolean on_flow_key_press(GtkWidget*, GdkEventKey* event, gpointer)
             gint  len     = g_unichar_to_utf8(ch, utf8);
             utf8[len]     = '\0';
 
-            const gchar* existing =
-                gtk_entry_get_text(GTK_ENTRY(g_ui.search));
-            std::string next = existing ? existing : "";
-            next += utf8;
+            GtkEditable* ed = GTK_EDITABLE(g_ui.search);
 
-            gtk_entry_set_text(GTK_ENTRY(g_ui.search), next.c_str());
-            gtk_editable_set_position(GTK_EDITABLE(g_ui.search), -1);
             gtk_widget_grab_focus(g_ui.search);
+
+            gint pos = gtk_editable_get_position(ed);
+            gtk_editable_insert_text(ed, utf8, len, &pos);
+            gtk_editable_set_position(ed, pos);
+
             return TRUE;
         }
+        
     }
 }
 
@@ -1529,8 +1527,8 @@ void populate_top_level()
     // Fresh grid, nothing filtered out -- rebuild the nav list before
     // anyone tries to press an arrow key.
     refresh_visible_children();
+    gtk_widget_grab_focus(g_ui.search);
 
-    gtk_widget_child_focus(g_ui.flow, GTK_DIR_TAB_FORWARD);
 }
 
 void populate_group(int group_index)
@@ -1585,7 +1583,7 @@ void populate_group(int group_index)
     // anyone tries to press an arrow key.
     refresh_visible_children();
 
-    gtk_widget_child_focus(g_ui.flow, GTK_DIR_TAB_FORWARD);
+    gtk_widget_grab_focus(g_ui.search);
 }
 
 
@@ -1621,14 +1619,7 @@ gboolean on_search_changed(GtkSearchEntry* entry, gpointer)
         needle.begin(), needle.end(), needle.begin(),
         [](unsigned char c) { return std::tolower(c); });
 
-    // The filter is about to change which tiles are visible, which
-    // may hide whatever the flowbox currently has selected. Drop that
-    // selection *before* recomputing visibility rather than after --
-    // otherwise a stale selection pointing at a now-hidden tile can
-    // linger and confuse move_selection()/current_visible_child() on
-    // the very next arrow-key press. (Keyboard focus itself is left
-    // alone here: the user is typically still typing in the search
-    // entry, and grabbing focus away mid-keystroke would be jarring.)
+
     gtk_flow_box_unselect_all(GTK_FLOW_BOX(g_ui.flow));
 
     GList* children =
@@ -1704,18 +1695,10 @@ gboolean on_search_changed(GtkSearchEntry* entry, gpointer)
 gboolean on_search_key_press(GtkWidget*, GdkEventKey* event, gpointer)
 {
     if (event->keyval == GDK_KEY_Escape) {
-        if (g_ui.current_group >= 0)
-            populate_top_level();
-        else
-            hide_ui();
-        return TRUE;
+        return TRUE;   // always consumed -- never bubbles to window
     }
 
     if (event->keyval == GDK_KEY_Down) {
-        // Hand off from the search entry into the grid: land on the
-        // first tile that currently survives the filter. Refresh
-        // defensively in case visibility changed without going
-        // through on_search_changed (e.g. a programmatic reset).
         refresh_visible_children();
 
         if (!g_ui.visible_children.empty())
@@ -1835,7 +1818,7 @@ void show_ui()
     // populate_top_level() already focuses the first tile; do it
     // again here in case show_all() reset focus.
     if (g_ui.flow != nullptr)
-        gtk_widget_child_focus(g_ui.flow, GTK_DIR_TAB_FORWARD);
+        gtk_widget_grab_focus(g_ui.search);
 }
 
 void toggle_ui()
@@ -1862,8 +1845,33 @@ gboolean on_delete_event(GtkWidget*, GdkEvent*, gpointer)
 gboolean on_key_press(GtkWidget*, GdkEventKey* event, gpointer)
 {
     if (event->keyval == GDK_KEY_Escape) {
+        if (g_ui.search != nullptr &&
+            gtk_window_get_focus(GTK_WINDOW(g_ui.window)) == g_ui.search)
+        {
+            const gchar* text =
+                gtk_entry_get_text(GTK_ENTRY(g_ui.search));
+
+            if (text != nullptr && *text != '\0') {
+                gtk_entry_set_text(GTK_ENTRY(g_ui.search), "");
+                gtk_editable_set_position(
+                    GTK_EDITABLE(g_ui.search), -1);
+
+                if (search_timeout_id != 0) {
+                    g_source_remove(search_timeout_id);
+                    search_timeout_id = 0;
+                }
+                on_search_changed(
+                    GTK_SEARCH_ENTRY(g_ui.search), nullptr);
+            } else {
+                if (g_ui.current_group >= 0)
+                    populate_top_level();
+                else
+                    hide_ui();
+                }
+        }
+
         // Escape: if inside a group, go back. Otherwise hide.
-        if (g_ui.current_group >= 0)
+        else if (g_ui.current_group >= 0)
             populate_top_level();
         else
             hide_ui();

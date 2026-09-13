@@ -1992,13 +1992,16 @@ gboolean on_delete_event(GtkWidget*, GdkEvent*, gpointer)
 gboolean on_key_press(GtkWidget*, GdkEventKey* event, gpointer)
 {
     if (event->keyval == GDK_KEY_Escape) {
+        const gchar* text = (g_ui.search != nullptr)
+            ? gtk_entry_get_text(GTK_ENTRY(g_ui.search))
+            : nullptr;
+
+        const bool has_text = (text != nullptr && *text != '\0');
+
         if (g_ui.search != nullptr &&
             gtk_window_get_focus(GTK_WINDOW(g_ui.window)) == g_ui.search)
         {
-            const gchar* text =
-                gtk_entry_get_text(GTK_ENTRY(g_ui.search));
-
-            if (text != nullptr && *text != '\0') {
+            if (has_text) {
                 gtk_entry_set_text(GTK_ENTRY(g_ui.search), "");
                 gtk_editable_set_position(
                     GTK_EDITABLE(g_ui.search), -1);
@@ -2014,19 +2017,28 @@ gboolean on_key_press(GtkWidget*, GdkEventKey* event, gpointer)
                     populate_top_level();
                 else
                     hide_ui();
-                }
+            }
         }
 
-        // Escape: if inside a group, go back. Otherwise hide.
-        else if (g_ui.current_group >= 0)
+        else if (g_ui.current_group >= 0 || has_text) {
+            if (g_ui.search != nullptr) {
+                gtk_entry_set_text(GTK_ENTRY(g_ui.search), "");
+
+                if (search_timeout_id != 0) {
+                    g_source_remove(search_timeout_id);
+                    search_timeout_id = 0;
+                }
+            }
             populate_top_level();
-        else
+        }
+        else {
             hide_ui();
+        }
+
         return TRUE;
     }
     return FALSE;
 }
-
 
 // ===========================================================================
 // Section 19: SIGUSR1 handler

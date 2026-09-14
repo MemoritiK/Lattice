@@ -2062,7 +2062,6 @@ void build_skeleton()
     g_ui.window = gtk_application_window_new(g_ui.application);
 
     gtk_window_set_title(GTK_WINDOW(g_ui.window), "Lattice");
-    gtk_window_set_default_size(GTK_WINDOW(g_ui.window), 760, 640);
 
     // ---- Layer shell ---------------------------------------------------
     gtk_layer_init_for_window(GTK_WINDOW(g_ui.window));

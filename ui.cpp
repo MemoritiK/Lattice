@@ -22,7 +22,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-
+#include <sys/wait.h>
 
 namespace fs = std::filesystem;
 
@@ -42,9 +42,18 @@ constexpr const char* UI_LOCK_FILE     = "/tmp/lattice/ui.lock";
 constexpr const char* DAEMON_PID_FILE  = "/tmp/lattice/daemon.pid";
 constexpr const char* DEFAULT_TERMINAL = "foot";
 
-constexpr int ICON_SIZE    = 86;
-constexpr int TILE_HEIGHT  = 150;
-constexpr int MINI         = 36;
+constexpr int ICON_SIZE    = 76;
+constexpr int TILE_HEIGHT  = 135;
+constexpr int MINI         = 30;
+
+// Backdrop blur. grim shoots the screen, we shrink it to BLUR_MAX_WIDTH,
+// box-blur it, and stretch it back over the window. Raise RADIUS/PASSES
+// for a stronger blur.
+constexpr const char* BACKDROP_FILE  = "/tmp/lattice/backdrop.png";
+constexpr const char* BLUR_OUTPUT    = nullptr;   // e.g. "DP-1" on multi-monitor
+constexpr int         BLUR_MAX_WIDTH = 320;
+constexpr int         BLUR_RADIUS    = 3;
+constexpr int         BLUR_PASSES    = 1;
 
 // Approximates the padding the old ".lattice-tile > box" CSS rule gave
 // the (now-removed) inner GtkBox. Tiles are drawn by hand now (see
@@ -57,7 +66,7 @@ constexpr int TILE_PADDING = 6;
 // move_selection()) needs to agree exactly with the flowbox's
 // min/max-children-per-line setting in build_skeleton() -- if the two
 // drift apart, Up/Down will jump to the wrong tile.
-constexpr int GRID_COLUMNS = 7;
+constexpr int GRID_COLUMNS = 8;
 
 
 // ===========================================================================
@@ -306,7 +315,7 @@ struct Ui
     bool     db_loaded = false;
 
     int lock_fd = -1;
-
+    GdkPixbuf* backdrop = nullptr;
     // Ordered list of the flowbox children that are currently
     // *visible* (i.e. survive the active search filter, or every
     // child when there's no filter). This is the single source of
@@ -416,7 +425,10 @@ static bool fuzzy_match(const std::string& needle, const std::string& hay)
 
 constexpr const char* LATTICE_CSS = R"CSS(
 .lattice-root {
-    background: rgba(15, 15, 15, 0.94);
+    background: linear-gradient(
+        to bottom,
+        rgba(20, 20, 20, 0.50),
+        rgba(12, 12, 12, 0.62));
 }
 
 .lattice-tile-group {
@@ -433,7 +445,7 @@ constexpr const char* LATTICE_CSS = R"CSS(
     min-height: 40px;
     border-radius: 20px;
     padding: 0 16px;
-    margin: 15px 0;
+    margin: 25px 0;
     font-size: 14px;
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.10);
@@ -648,6 +660,145 @@ PangoFontDescription* tile_label_font()
     return desc;
 }
 
+
+// ===========================================================================
+// Section 8b: Backdrop blur
+// ===========================================================================
+
+void box_blur_line(guchar* base, int n, int step, int nch, int r, guchar* tmp)
+{
+    const int div = 2 * r + 1;
+    auto at = [&](int i) { return std::clamp(i, 0, n - 1) * step; };
+
+    for (int c = 0; c < nch; ++c) {
+        int sum = 0;
+        for (int k = -r; k <= r; ++k) sum += base[at(k) + c];
+
+        for (int i = 0; i < n; ++i) {
+            tmp[i * nch + c] = static_cast<guchar>(sum / div);
+            sum += base[at(i + r + 1) + c] - base[at(i - r) + c];
+        }
+    }
+
+    for (int i = 0; i < n; ++i)
+        for (int c = 0; c < nch; ++c)
+            base[i * step + c] = tmp[i * nch + c];
+}
+
+void box_blur(GdkPixbuf* pb, int r, int passes)
+{
+    const int w      = gdk_pixbuf_get_width(pb);
+    const int h      = gdk_pixbuf_get_height(pb);
+    const int nch    = gdk_pixbuf_get_n_channels(pb);
+    const int stride = gdk_pixbuf_get_rowstride(pb);
+    guchar*   px     = gdk_pixbuf_get_pixels(pb);
+
+    std::vector<guchar> tmp(static_cast<std::size_t>(std::max(w, h)) * nch);
+
+    for (int p = 0; p < passes; ++p) {
+        for (int y = 0; y < h; ++y)
+            box_blur_line(px + y * stride, w, nch, nch, r, tmp.data());
+        for (int x = 0; x < w; ++x)
+            box_blur_line(px + x * nch, h, stride, nch, r, tmp.data());
+    }
+}
+
+// Screenshots the desktop via grim and returns a small blurred pixbuf
+// (caller owns it), or nullptr if grim is missing/failed. MUST be called
+// while the launcher window is hidden, or it will capture itself.
+GdkPixbuf* capture_backdrop()
+{
+    std::vector<std::string> args = { "grim", "-s", "0.1", "-l", "0" };
+    if (BLUR_OUTPUT != nullptr) {
+        args.push_back("-o");
+        args.push_back(BLUR_OUTPUT);
+    }
+    args.push_back(BACKDROP_FILE);
+
+    std::vector<char*> raw;
+    for (auto& s : args) raw.push_back(s.data());
+    raw.push_back(nullptr);
+
+    gint    status = 0;
+    GError* error  = nullptr;
+
+    if (!g_spawn_sync(nullptr, raw.data(), nullptr,
+                      static_cast<GSpawnFlags>(G_SPAWN_SEARCH_PATH |
+                                               G_SPAWN_STDOUT_TO_DEV_NULL |
+                                               G_SPAWN_STDERR_TO_DEV_NULL),
+                      nullptr, nullptr, nullptr, nullptr, &status, &error))
+    {
+        std::fprintf(stderr, "[lattice] grim spawn failed: %s\n",
+                     error ? error->message : "unknown");
+        if (error) g_error_free(error);
+        return nullptr;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::fprintf(stderr, "[lattice] grim exited with an error\n");
+        return nullptr;
+    }
+
+    GdkPixbuf* pb = gdk_pixbuf_new_from_file(BACKDROP_FILE, nullptr);
+    ::unlink(BACKDROP_FILE);
+    if (pb == nullptr) return nullptr;
+
+    // Shrink further if grim's scaling wasn't honoured / was too generous.
+    const int w = gdk_pixbuf_get_width(pb);
+    const int h = gdk_pixbuf_get_height(pb);
+    if (w > BLUR_MAX_WIDTH) {
+        const int nh = std::max(1, h * BLUR_MAX_WIDTH / w);
+        GdkPixbuf* small = gdk_pixbuf_scale_simple(
+            pb, BLUR_MAX_WIDTH, nh, GDK_INTERP_BILINEAR);
+        g_object_unref(pb);
+        if (small == nullptr) return nullptr;
+        pb = small;
+    }
+
+    box_blur(pb, BLUR_RADIUS, BLUR_PASSES);
+    return pb;
+}
+
+// Takes ownership of `pb` (may be nullptr to clear). Toggles the CSS
+// class that switches .lattice-root between "tint over backdrop" and
+// the old near-opaque fallback.
+void set_backdrop(GdkPixbuf* pb)
+{
+    if (g_ui.backdrop != nullptr) g_object_unref(g_ui.backdrop);
+    g_ui.backdrop = pb;
+
+    if (g_ui.main_box != nullptr) {
+        GtkStyleContext* sc = gtk_widget_get_style_context(g_ui.main_box);
+        if (pb != nullptr) gtk_style_context_add_class(sc, "lattice-backdrop");
+        else               gtk_style_context_remove_class(sc, "lattice-backdrop");
+        gtk_widget_queue_draw(g_ui.main_box);
+    }
+}
+
+// Connected to main_box's "draw". User handlers run before GTK paints
+// the CSS background, so the tint from .lattice-root lands on top of
+// the blurred image.
+gboolean on_root_draw(GtkWidget* widget, cairo_t* cr, gpointer)
+{
+    if (g_ui.backdrop == nullptr) return FALSE;
+
+    const int iw = gdk_pixbuf_get_width(g_ui.backdrop);
+    const int ih = gdk_pixbuf_get_height(g_ui.backdrop);
+
+    cairo_save(cr);
+    cairo_scale(cr,
+                static_cast<double>(gtk_widget_get_allocated_width(widget))  / iw,
+                static_cast<double>(gtk_widget_get_allocated_height(widget)) / ih);
+    gdk_cairo_set_source_pixbuf(cr, g_ui.backdrop, 0, 0);
+
+    cairo_pattern_t* pat = cairo_get_source(cr);
+    cairo_pattern_set_filter(pat, CAIRO_FILTER_BILINEAR);
+    cairo_pattern_set_extend(pat, CAIRO_EXTEND_PAD);   // no seams at the edges
+
+    cairo_paint(cr);
+    cairo_restore(cr);
+    return FALSE;
+}
 
 // ===========================================================================
 // Section 9: Launching & editing
@@ -1948,12 +2099,14 @@ void hide_ui()
     g_ui.db = Database();
     g_ui.db_loaded = false;
     g_ui.current_group = -1;
+        set_backdrop(nullptr);
 }
 
 void show_ui()
 {
     if (g_ui.window == nullptr) return;
-
+    if (!gtk_widget_get_visible(g_ui.window))
+        set_backdrop(capture_backdrop());
     // Re-read the DB each time the window is shown, so a daemon
     // update is reflected. Invalidate the cache.
     g_ui.db_loaded = false;
@@ -2106,7 +2259,8 @@ void build_skeleton()
     gtk_style_context_add_class(
         gtk_widget_get_style_context(g_ui.main_box), "lattice-root");
     gtk_container_add(GTK_CONTAINER(g_ui.window), g_ui.main_box);
-
+    g_signal_connect(g_ui.main_box, "draw",
+                     G_CALLBACK(on_root_draw), nullptr);
     // ---- Compact, centered search bar ----------------------------------
     GtkWidget* search_wrap = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(search_wrap, GTK_ALIGN_CENTER);
@@ -2200,7 +2354,6 @@ void build_skeleton()
 
     gtk_container_add(GTK_CONTAINER(g_ui.scroll), g_ui.flow);
 
-    gtk_widget_show_all(g_ui.window);
 }
 
 

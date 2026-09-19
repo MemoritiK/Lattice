@@ -49,10 +49,10 @@ constexpr int MINI         = 30;
 // Backdrop blur. grim shoots the screen, we shrink it to BLUR_MAX_WIDTH,
 // box-blur it, and stretch it back over the window. Raise RADIUS/PASSES
 // for a stronger blur.
-constexpr const char* BACKDROP_FILE  = "/tmp/lattice/backdrop.png";
+constexpr const char* BACKDROP_FILE  = "/home/smritik/.config/assets/backgrounds/wallpaper.png";
 constexpr const char* BLUR_OUTPUT    = nullptr;   // e.g. "DP-1" on multi-monitor
 constexpr int         BLUR_MAX_WIDTH = 320;
-constexpr int         BLUR_RADIUS    = 3;
+constexpr int         BLUR_RADIUS    = 5;
 constexpr int         BLUR_PASSES    = 1;
 
 // Approximates the padding the old ".lattice-tile > box" CSS rule gave
@@ -425,10 +425,7 @@ static bool fuzzy_match(const std::string& needle, const std::string& hay)
 
 constexpr const char* LATTICE_CSS = R"CSS(
 .lattice-root {
-    background: linear-gradient(
-        to bottom,
-        rgba(20, 20, 20, 0.50),
-        rgba(12, 12, 12, 0.62));
+    background-color: rgba(0, 0, 0, 0.7);
 }
 
 .lattice-tile-group {
@@ -708,39 +705,7 @@ void box_blur(GdkPixbuf* pb, int r, int passes)
 // while the launcher window is hidden, or it will capture itself.
 GdkPixbuf* capture_backdrop()
 {
-    std::vector<std::string> args = { "grim", "-s", "0.1", "-l", "0" };
-    if (BLUR_OUTPUT != nullptr) {
-        args.push_back("-o");
-        args.push_back(BLUR_OUTPUT);
-    }
-    args.push_back(BACKDROP_FILE);
-
-    std::vector<char*> raw;
-    for (auto& s : args) raw.push_back(s.data());
-    raw.push_back(nullptr);
-
-    gint    status = 0;
-    GError* error  = nullptr;
-
-    if (!g_spawn_sync(nullptr, raw.data(), nullptr,
-                      static_cast<GSpawnFlags>(G_SPAWN_SEARCH_PATH |
-                                               G_SPAWN_STDOUT_TO_DEV_NULL |
-                                               G_SPAWN_STDERR_TO_DEV_NULL),
-                      nullptr, nullptr, nullptr, nullptr, &status, &error))
-    {
-        std::fprintf(stderr, "[lattice] grim spawn failed: %s\n",
-                     error ? error->message : "unknown");
-        if (error) g_error_free(error);
-        return nullptr;
-    }
-
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        std::fprintf(stderr, "[lattice] grim exited with an error\n");
-        return nullptr;
-    }
-
     GdkPixbuf* pb = gdk_pixbuf_new_from_file(BACKDROP_FILE, nullptr);
-    ::unlink(BACKDROP_FILE);
     if (pb == nullptr) return nullptr;
 
     // Shrink further if grim's scaling wasn't honoured / was too generous.

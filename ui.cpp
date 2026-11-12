@@ -1,5 +1,5 @@
 #include "db.hpp"
-
+#include <malloc.h>   // malloc_trim
 #include <gtk/gtk.h>
 #include <gtk-layer-shell/gtk-layer-shell.h>
 #include <glib-unix.h>
@@ -42,9 +42,9 @@ constexpr const char* UI_LOCK_FILE     = "/tmp/lattice/ui.lock";
 constexpr const char* DAEMON_PID_FILE  = "/tmp/lattice/daemon.pid";
 constexpr const char* DEFAULT_TERMINAL = "foot";
 
-constexpr int ICON_SIZE    = 86;
-constexpr int TILE_HEIGHT  = 150;
-constexpr int MINI         = 36;
+constexpr int ICON_SIZE    = 76;
+constexpr int TILE_HEIGHT  = 132;
+constexpr int MINI         = 32;
 
 // Approximates the padding the old ".lattice-tile > box" CSS rule gave
 // the (now-removed) inner GtkBox. Tiles are drawn by hand now (see
@@ -57,8 +57,10 @@ constexpr int TILE_PADDING = 6;
 // move_selection()) needs to agree exactly with the flowbox's
 // min/max-children-per-line setting in build_skeleton() -- if the two
 // drift apart, Up/Down will jump to the wrong tile.
-constexpr int GRID_COLUMNS = 7;
-
+constexpr int GRID_COLUMNS = 6;
+constexpr int WINDOW_WIDTH      = 1200;
+constexpr int WINDOW_HEIGHT     = 660;
+constexpr int WINDOW_TOP_MARGIN = 2;    // padding from top of screen
 
 // ===========================================================================
 // Section 1: Session / PID / process helpers
@@ -166,25 +168,6 @@ std::string terminal_command()
     // 1. Explicit default, if set.
     if (DEFAULT_TERMINAL != nullptr && *DEFAULT_TERMINAL)
         return DEFAULT_TERMINAL;
-
-    // 2. Respect $TERMINAL.
-    if (const char* t = std::getenv("TERMINAL"); t && *t)
-        return t;
-
-    // 3. Probe common ones in order of preference.
-    const char* candidates[] = {
-        "kitty", "alacritty", "wezterm", "foot",
-        "gnome-terminal", "konsole", "xfce4-terminal",
-        "xterm",
-    };
-
-    for (const char* c : candidates) {
-        std::string probe =
-            std::string("command -v ") + c + " >/dev/null 2>&1";
-        if (std::system(probe.c_str()) == 0)
-            return c;
-    }
-
     return {};
 }
 
@@ -415,8 +398,13 @@ static bool fuzzy_match(const std::string& needle, const std::string& hay)
 // ===========================================================================
 
 constexpr const char* LATTICE_CSS = R"CSS(
+.lattice-window {
+    background: transparent;
+}
+
 .lattice-root {
-    background: rgba(15, 15, 15, 0.94);
+    background: rgb(13, 15, 17);
+    border-radius: 18px;
 }
 
 .lattice-tile-group {
@@ -430,11 +418,11 @@ constexpr const char* LATTICE_CSS = R"CSS(
 }
 
 .lattice-search {
-    min-height: 40px;
+    min-height: 30px;
     border-radius: 20px;
-    padding: 0 16px;
-    margin: 15px 0;
-    font-size: 14px;
+    padding: 0 10px;
+    margin: 13px 0;
+    font-size: 13px;
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.10);
     color: #f0f0f0;
@@ -1376,36 +1364,29 @@ void scroll_widget_into_view(GtkWidget* widget)
     if (widget == nullptr || g_ui.scroll == nullptr || g_ui.flow == nullptr)
         return;
 
-    // Walk up from the focused widget to find the direct flowbox
-    // child that contains it. If we hit the flowbox itself or run
-    // out of parents first, this focus event isn't about a tile.
     GtkWidget* w = widget;
     while (w != nullptr && w != g_ui.flow && gtk_widget_get_parent(w) != g_ui.flow)
         w = gtk_widget_get_parent(w);
 
     if (w == nullptr || w == g_ui.flow) return;
 
-    GtkAllocation alloc;
-    gtk_widget_get_allocation(widget, &alloc);
-
-    gint tile_y = 0;
-    gtk_widget_translate_coordinates(
-        widget, g_ui.flow, 0, 0, nullptr, &tile_y);
-
     GtkAdjustment* adj =
         gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(g_ui.scroll));
     if (adj == nullptr) return;
 
-    double top         = tile_y;
-    double bottom      = tile_y + alloc.height;
-    double view_top    = gtk_adjustment_get_value(adj);
-    double view_bottom = view_top + gtk_adjustment_get_page_size(adj);
+    gint y = 0;
+    gtk_widget_translate_coordinates(w, g_ui.flow, 0, 0, nullptr, &y);
+    y += gtk_widget_get_margin_top(g_ui.flow);
 
-    if (top < view_top)
+    const double top    = y - 10;
+    const double bottom = y + gtk_widget_get_allocated_height(w) + 10;
+    const double page   = gtk_adjustment_get_page_size(adj);
+    const double value  = gtk_adjustment_get_value(adj);
+
+    if (top < value)
         gtk_adjustment_set_value(adj, top);
-    else if (bottom > view_bottom)
-        gtk_adjustment_set_value(
-            adj, bottom - gtk_adjustment_get_page_size(adj));
+    else if (bottom > value + page)
+        gtk_adjustment_set_value(adj, bottom - page);
 }
 
 void on_window_set_focus(GtkWindow*, GtkWidget* widget, gpointer)
@@ -1948,6 +1929,8 @@ void hide_ui()
     g_ui.db = Database();
     g_ui.db_loaded = false;
     g_ui.current_group = -1;
+
+    malloc_trim(0);   // release freed heap pages back to the OS
 }
 
 void show_ui()
@@ -2063,23 +2046,41 @@ void build_skeleton()
 
     gtk_window_set_title(GTK_WINDOW(g_ui.window), "Lattice");
 
-    // ---- Layer shell ---------------------------------------------------
+    // ---- RGBA visual so the rounded corners can be transparent ---------
+    // Must happen before the window is realized.
+    {
+        GdkScreen* screen = gtk_widget_get_screen(g_ui.window);
+        GdkVisual* visual = gdk_screen_get_rgba_visual(screen);
+        if (visual != nullptr && gdk_screen_is_composited(screen))
+            gtk_widget_set_visual(g_ui.window, visual);
+        gtk_widget_set_app_paintable(g_ui.window, TRUE);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(g_ui.window), "lattice-window");
+    }
+
+    // ---- Layer shell: floating panel, top-centered ---------------------
     gtk_layer_init_for_window(GTK_WINDOW(g_ui.window));
 
     gtk_layer_set_layer(
         GTK_WINDOW(g_ui.window),
         GTK_LAYER_SHELL_LAYER_TOP);
 
+    // Anchor ONLY to the top edge: the compositor centers the surface
+    // horizontally and uses our requested size instead of stretching it.
     gtk_layer_set_anchor(
         GTK_WINDOW(g_ui.window), GTK_LAYER_SHELL_EDGE_TOP,    TRUE);
     gtk_layer_set_anchor(
-        GTK_WINDOW(g_ui.window), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
+        GTK_WINDOW(g_ui.window), GTK_LAYER_SHELL_EDGE_BOTTOM, FALSE);
     gtk_layer_set_anchor(
-        GTK_WINDOW(g_ui.window), GTK_LAYER_SHELL_EDGE_LEFT,   TRUE);
+        GTK_WINDOW(g_ui.window), GTK_LAYER_SHELL_EDGE_LEFT,   FALSE);
     gtk_layer_set_anchor(
-        GTK_WINDOW(g_ui.window), GTK_LAYER_SHELL_EDGE_RIGHT,  TRUE);
+        GTK_WINDOW(g_ui.window), GTK_LAYER_SHELL_EDGE_RIGHT,  FALSE);
 
-    gtk_layer_set_exclusive_zone(GTK_WINDOW(g_ui.window), -1);
+    gtk_layer_set_margin(
+        GTK_WINDOW(g_ui.window),
+        GTK_LAYER_SHELL_EDGE_TOP, WINDOW_TOP_MARGIN);
+
+    gtk_layer_set_exclusive_zone(GTK_WINDOW(g_ui.window), 0);
     gtk_layer_set_namespace(GTK_WINDOW(g_ui.window), "lattice-shell");
 
     gtk_layer_set_keyboard_mode(
@@ -2087,6 +2088,12 @@ void build_skeleton()
         GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE);
 
     gtk_window_set_decorated(GTK_WINDOW(g_ui.window), FALSE);
+    gtk_window_set_default_size(
+        GTK_WINDOW(g_ui.window), WINDOW_WIDTH, WINDOW_HEIGHT);
+    gtk_widget_set_size_request(
+        g_ui.window, WINDOW_WIDTH, WINDOW_HEIGHT);
+    gtk_window_set_resizable(GTK_WINDOW(g_ui.window), FALSE);
+    // --------------------------------------------------------------------
     // --------------------------------------------------------------------
 
     g_signal_connect(g_ui.window, "delete-event",
